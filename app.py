@@ -923,12 +923,18 @@ if __name__ == "__main__":
     merged = ",".join(parts)
     os.environ["NO_PROXY"] = merged
     os.environ["no_proxy"] = merged
-    port_raw = os.getenv("GRADIO_SERVER_PORT", "").strip()
-    server_port = int(port_raw) if port_raw.isdigit() else None
+    
+    # 【修改点 1】优先读取 Render 平台自动注入的 "PORT" 环境变量
+    port_raw = os.getenv("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")).strip()
+    server_port = int(port_raw) if port_raw.isdigit() else 7860
+    
     import inspect
     STATIC_OUTPUT_DIR = "static_outputs"
     launch_sig = inspect.signature(demo.launch)
+    
+    # 【修改点 2】必须将 server_name 改为 "0.0.0.0" 才能被外网访问。
+    # （注：同时删除了 share=True，因为 Render 已经自带 HTTPS 域名，开启 share 反而会导致服务卡死或报错）
     if "allowed_paths" in launch_sig.parameters:
-        demo.launch(server_name="127.0.0.1", server_port=server_port, allowed_paths=[STATIC_OUTPUT_DIR], share=True, theme=theme, css=custom_css)
+        demo.launch(server_name="0.0.0.0", server_port=server_port, allowed_paths=[STATIC_OUTPUT_DIR], theme=theme, css=custom_css)
     else:
-        demo.launch(server_name="127.0.0.1", server_port=server_port)
+        demo.launch(server_name="0.0.0.0", server_port=server_port)
