@@ -1,8 +1,5 @@
 import os
-from dotenv import load_dotenv
 
-# 加载 .env 文件中的变量
-load_dotenv() 
 
 # 然后正常读取即可
 COZE_API_TOKEN = os.getenv("COZE_API_TOKEN", "").strip()
