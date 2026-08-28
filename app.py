@@ -381,11 +381,15 @@ def parse_comic_panels(raw_data):
         # 清除残留的独立 URL
         text = re.sub(r'https?://[^\s`\'")\\]+', '', text)
         
-        # === 新增：强力清除 JSON 外壳与乱码 ===
+        # === 强力清除 JSON 外壳与乱码 ===
         # 清除包含 "node_status", "Output", "final_comic" 等字典键值对的废弃头部
         text = re.sub(r'\{.*?"final_comic[^:]*:[^a-zA-Z0-9\u4e00-\u9fa5]*', '', text)
         # 清除所有的转义反斜杠 (如 \\, \\\\)
         text = text.replace('\\', '')
+        
+        # === 新增：清除 Markdown 遗留的加粗星号 ===
+        text = text.replace('**', '')
+        
         # 清除开头和结尾残留的孤立标点（引号、大括号等）
         text = re.sub(r'^["{}\s]+', '', text)
         text = re.sub(r'["}\s]+$', '', text)
