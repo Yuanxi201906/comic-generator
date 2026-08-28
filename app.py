@@ -16,7 +16,10 @@ load_dotenv()
 COZE_API_TOKEN = os.getenv("COZE_API_TOKEN", "")
 CHAT_BOT_ID = os.getenv("CHAT_BOT_ID", "")
 SCRIPT_BOT_ID = os.getenv("SCRIPT_BOT_ID", "")
-COZE_WORKFLOW_ID = os.getenv("COZE_WORKFLOW_ID", "") 
+COZE_WORKFLOW_ID = os.getenv("COZE_WORKFLOW_ID", "")
+
+# 禁用代理，避免系统代理干扰 Coze API 直连
+NO_PROXY = {"http": None, "https": None} 
 
 # ==========================================
 # 2. 核心 API 引擎：扣子 (Coze) v3 接口调用
@@ -45,7 +48,7 @@ def call_coze_bot_v3(bot_id, user_id, message):
     }
 
     try:
-        chat_res = requests.post(chat_url, headers=headers, json=payload).json()
+        chat_res = requests.post(chat_url, headers=headers, json=payload, proxies=NO_PROXY).json()
         if chat_res.get("code") != 0:
             return f"接口请求失败: {chat_res.get('msg', '未知错误')}"
         
@@ -55,7 +58,7 @@ def call_coze_bot_v3(bot_id, user_id, message):
         # 第二步：轮询检查对话状态 (Retrieve Chat)
         retrieve_url = f"https://api.coze.cn/v3/chat/retrieve?chat_id={chat_id}&conversation_id={conversation_id}"
         while True:
-            ret_res = requests.get(retrieve_url, headers=headers).json()
+            ret_res = requests.get(retrieve_url, headers=headers, proxies=NO_PROXY).json()
             status = ret_res["data"]["status"]
             
             if status == "completed":
@@ -67,7 +70,7 @@ def call_coze_bot_v3(bot_id, user_id, message):
 
         # 第三步：获取最新生成的回复 (List Messages)
         msg_url = f"https://api.coze.cn/v3/chat/message/list?chat_id={chat_id}&conversation_id={conversation_id}"
-        msg_res = requests.get(msg_url, headers=headers).json()
+        msg_res = requests.get(msg_url, headers=headers, proxies=NO_PROXY).json()
         
         # 遍历消息，寻找属于 bot (assistant) 且类型为 answer 的回复
         messages = msg_res.get("data", [])
@@ -90,37 +93,38 @@ def call_coze_bot_v3(bot_id, user_id, message):
 def upload_image_to_coze(image_path):
     """调用 Coze 文件上传 API，获取合法的 file_id"""
     if not image_path:
-        # 如果用户没传图，返回 None
-        return None
+        return None, "未提供图片路径。"
     
     url = "https://api.coze.cn/v1/files/upload"
     headers = {
         "Authorization": f"Bearer {COZE_API_TOKEN}"
-        # 注意：这里千万不要写 "Content-Type": "application/json"，requests 会自动处理文件头
     }
     
     try:
         with open(image_path, "rb") as f:
-            # 传给扣子的文件
             files = {"file": f}
-            res = requests.post(url, headers=headers, files=files).json()
+            res = requests.post(url, headers=headers, files=files, proxies=NO_PROXY)
+            print(f"[DEBUG] 图片上传响应: HTTP {res.status_code}, body={res.text[:500]}")
+            res_data = res.json()
             
-        if res.get("code") == 0:
-            # 上传成功，返回扣子官方认可的 file_id
-            return res["data"]["id"]
+        if res_data.get("code") == 0:
+            return res_data["data"]["id"], None
         else:
-            print(f"图片上传失败，原因: {res}")
-            return None
+            error_msg = res_data.get("msg", "未知错误")
+            print(f"图片上传失败，原因: {res_data}")
+            return None, f"扣子图片上传失败：{error_msg}"
             
+    except FileNotFoundError:
+        return None, f"图片文件不存在：{image_path}"
     except Exception as e:
         print(f"图片上传异常: {str(e)}")
-        return None
+        return None, f"图片上传异常：{str(e)}"
 
 
 def download_image_to_local(image_url):
     """将远程图片下载到本地临时文件，解决 Gradio SSRF 白名单限制。"""
     try:
-        response = requests.get(image_url, timeout=30, stream=True)
+        response = requests.get(image_url, timeout=30, stream=True, proxies=NO_PROXY)
         if response.status_code == 200:
             import tempfile
             suffix = os.path.splitext(image_url.split("?")[0])[1] or ".png"
@@ -163,26 +167,58 @@ def run_coze_workflow(script, image_param):
 
     payload = {
         "workflow_id": COZE_WORKFLOW_ID,
-        "parameters": parameters
+        "parameters": parameters,
+        "is_async": True
     }
 
     try:
         # 第一步：发起异步工作流执行
-        async_url = "https://api.coze.cn/v1/workflow/async_run"
-        async_res = requests.post(async_url, headers=headers, json=payload, timeout=30)
+        async_url = "https://api.coze.cn/v1/workflow/run"
+        async_res = requests.post(async_url, headers=headers, json=payload, timeout=30, proxies=NO_PROXY)
         async_data = async_res.json()
+        print(f"[DEBUG] 工作流启动响应: {json.dumps(async_data, ensure_ascii=False)}")
         if async_data.get("code") != 0:
             print(f"异步工作流启动失败: {async_data}")
             return None, f"扣子工作流启动失败：{async_data.get('msg', '未知错误')}", None
 
         execute_id = async_data.get("data", {}).get("execute_id")
         if not execute_id:
-            return None, "扣子工作流启动失败：未获取到 execute_id。", None
+            execute_id = async_data.get("execute_id")
+        if not execute_id:
+            data = async_data.get("data", {})
+            if isinstance(data, dict):
+                for key in data:
+                    if "id" in key.lower() or "run" in key.lower():
+                        execute_id = data[key]
+                        break
+            if not execute_id and isinstance(data, str):
+                execute_id = data
+        if not execute_id:
+            data = async_data.get("data", {})
+            if isinstance(data, dict) and data.get("output"):
+                print("工作流同步返回结果，无需轮询。")
+                output = data.get("output", "{}")
+                if isinstance(output, str):
+                    try:
+                        data_dict = json.loads(output)
+                    except json.JSONDecodeError:
+                        data_dict = {"output": output}
+                else:
+                    data_dict = output or {}
+                image_url = find_image_url(data_dict)
+                if image_url:
+                    local_path = download_image_to_local(image_url)
+                    if local_path:
+                        return local_path, None, data_dict
+                    return None, f"图片下载失败，原始 URL：{image_url}", None
+                return None, f"工作流已执行，但返回结果中没有图片 URL：{data_dict}", None
+            return None, f"扣子工作流启动失败：未获取到 execute_id。响应内容: {json.dumps(async_data, ensure_ascii=False)}", None
 
         print(f"异步工作流已启动，execute_id: {execute_id}，开始轮询等待结果...")
 
         # 第二步：轮询查询异步工作流执行结果，最多等待 30 分钟
-        retrieve_url = "https://api.coze.cn/v1/workflow/async_run/retrieve"
+        # 【修复1】修正 Coze 获取工作流历史结果的正确 API 路径
+        retrieve_url = f"https://api.coze.cn/v1/workflows/{COZE_WORKFLOW_ID}/run_histories/{execute_id}"
         max_wait_seconds = 1800  # 30 分钟
         poll_interval = 5  # 每 5 秒轮询一次
         elapsed = 0
@@ -191,23 +227,40 @@ def run_coze_workflow(script, image_param):
             time.sleep(poll_interval)
             elapsed += poll_interval
 
+            # 【修复2】参数已经拼接在 URL 中，去掉 requests.get 中的 params 字典
             ret_res = requests.get(
                 retrieve_url,
                 headers=headers,
-                params={"execute_id": execute_id, "workflow_id": COZE_WORKFLOW_ID},
-                timeout=30
+                timeout=30,
+                proxies=NO_PROXY
             )
             ret_data = ret_res.json()
+
+            if elapsed == poll_interval:
+                print(f"[DEBUG] 轮询响应: {json.dumps(ret_data, ensure_ascii=False)}")
 
             if ret_data.get("code") != 0:
                 print(f"查询工作流状态失败: {ret_data}")
                 continue
 
-            execute_status = ret_data.get("data", {}).get("execute_status")
+            # 【修复3】部分版本 API 返回的 data 可能被包裹在列表里，增加兼容处理
+            data = ret_data.get("data", {})
+            if isinstance(data, list):
+                data = data[0] if len(data) > 0 else {}
+
+            # 【修复4】增加 .lower() 防止 Coze 返回 "Success" 导致的大写不匹配陷入死循环
+            execute_status = str(
+                data.get("execute_status") or
+                data.get("status") or
+                data.get("run_status") or
+                data.get("state") or
+                ""
+            ).lower()
+            
             print(f"工作流状态: {execute_status} (已等待 {elapsed}s)")
 
-            if execute_status == "success":
-                output = ret_data.get("data", {}).get("output", "{}")
+            if execute_status in ("success", "completed"):
+                output = data.get("output", "{}")
                 if isinstance(output, str):
                     try:
                         data_dict = json.loads(output)
@@ -224,11 +277,12 @@ def run_coze_workflow(script, image_param):
                     return None, f"图片下载失败，原始 URL：{image_url}", None
                 return None, f"工作流已执行，但返回结果中没有图片 URL：{data_dict}", None
 
-            elif execute_status == "failed":
-                error_msg = ret_data.get("data", {}).get("output", "未知错误")
+            elif execute_status in ("failed", "fail"):
+                # 获取具体的报错原因
+                error_msg = data.get("error_message", data.get("output", "未知错误"))
                 return None, f"扣子工作流执行失败：{error_msg}", None
 
-            elif execute_status in ("running", "queued"):
+            elif execute_status in ("running", "queued", "pending", ""):
                 continue
 
         # 超时
@@ -273,78 +327,114 @@ def find_image_url(value):
 
 
 def parse_comic_panels(raw_data):
-    """从工作流返回的原始数据中解析出所有漫画分镜（图片URL + 对应台词）。"""
+    """从工作流返回的原始数据中精准解析出所有漫画分镜（多图+文本）"""
     import re
+    import json
     
-    raw_text = None
+    raw_text = ""
+    
+    # 1. 安全地提取纯文本 Markdown，剥离多余的 JSON 外壳
     if isinstance(raw_data, dict):
         for key in ("final_comic", "output", "data", "comic", "result"):
             val = raw_data.get(key)
-            if isinstance(val, str) and "http" in val:
-                raw_text = val
-                break
-        if raw_text is None:
-            for val in raw_data.values():
-                if isinstance(val, str) and "http" in val:
-                    raw_text = val
-                    break
-    
+            if isinstance(val, str):
+                try:
+                    inner_dict = json.loads(val)
+                    if isinstance(inner_dict, dict) and "final_comic" in inner_dict:
+                        raw_text = inner_dict["final_comic"]
+                        break
+                    elif isinstance(inner_dict, dict):
+                        raw_text = list(inner_dict.values())[0]
+                        break
+                except json.JSONDecodeError:
+                    if "http" in val:
+                        raw_text = val
+                        break
+        # fallback
+        if not raw_text:
+            raw_text = json.dumps(raw_data, ensure_ascii=False)
+    else:
+        raw_text = str(raw_data)
+
     if not raw_text:
         return []
+
+    # 2. 将字面上的 "\\n" 还原为真正的换行符
+    raw_text = raw_text.replace('\\n', '\n')
+
+    # 3. 强力切割：匹配由三个以上减号组成的分割线（忽略前后的空白与换行）
+    blocks = re.split(r'\s*-{3,}\s*', raw_text)
     
     panels = []
-    blocks = re.split(r'\n---\n|\n---|\n\n---\n\n', raw_text)
-    
     for block in blocks:
         block = block.strip()
         if not block:
             continue
-        
+            
+        # 提取当前分段内的所有 URL
         urls = re.findall(r'https?://[^\s`\'")\\]+', block)
         image_url = urls[0] if urls else None
         
-        text = re.sub(r'!`?https?://[^\s`\'")\\]+`?', '', block)
+        # 4. 深度清理文本内容
+        # 清除 Markdown 的图片语法：![xxx](url)
+        text = re.sub(r'!\[.*?\]\(https?://[^\s`\'")\\]+\)', '', block)
+        # 清除残留的独立 URL
+        text = re.sub(r'https?://[^\s`\'")\\]+', '', text)
+        
+        # === 新增：强力清除 JSON 外壳与乱码 ===
+        # 清除包含 "node_status", "Output", "final_comic" 等字典键值对的废弃头部
+        text = re.sub(r'\{.*?"final_comic[^:]*:[^a-zA-Z0-9\u4e00-\u9fa5]*', '', text)
+        # 清除所有的转义反斜杠 (如 \\, \\\\)
+        text = text.replace('\\', '')
+        # 清除开头和结尾残留的孤立标点（引号、大括号等）
+        text = re.sub(r'^["{}\s]+', '', text)
+        text = re.sub(r'["}\s]+$', '', text)
+        
         text = text.strip()
         
         if image_url:
             panels.append({"image_url": image_url, "text": text})
-    
+            
     return panels
 
 
 def render_comic_html(panels):
-    """将分镜列表渲染为可滚动的漫画 HTML。"""
+    """将分镜列表渲染为目标样式的列表排版，图片在上，文字在下"""
+    import re
+    
     if not panels:
         return "<div style='text-align:center;color:#999;padding:40px;'>等待生成漫画...</div>"
     
     html_parts = [
-        "<div style='max-height:70vh;overflow-y:auto;padding:10px;"
-        "background:rgba(255,255,255,0.9);border-radius:20px;"
-        "box-shadow:0 4px 20px rgba(0,0,0,0.08);'>"
+        "<div style='max-height:85vh; overflow-y:auto; padding:10px;'>"
     ]
     
     for i, panel in enumerate(panels):
         img_url = panel.get("image_url", "")
         text = panel.get("text", "")
         
+        # 将 Markdown 加粗格式 **角色** 转换为 HTML 加粗 <strong>
+        text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
+        
         local_path = download_image_to_local(img_url) if img_url else None
         img_src = f"file={local_path}" if local_path else img_url
         
+        # HTML/CSS 结构：模仿图二极简风格
         html_parts.append(
-            f"<div style='margin-bottom:20px;text-align:center;'>"
+            f"<div style='margin-bottom: 20px;'>"
             f"<img src='{img_src}' "
-            f"style='max-width:100%;border-radius:16px;"
-            f"box-shadow:0 6px 24px rgba(0,0,0,0.12);' "
+            f"style='width:100%; border-radius:12px; display:block; margin:0 auto;' "
             f"onerror=\"this.onerror=null;this.src='{img_url}';\" />"
-            f"<div style='margin-top:10px;padding:10px 16px;"
-            f"background:linear-gradient(135deg,#FFF5F5,#FFF8E7);"
-            f"border-radius:12px;font-size:15px;line-height:1.7;"
-            f"color:#333;font-weight:500;'>"
+            f"<div style='margin-top: 15px; font-size: 16px; line-height: 1.6; color: #333; text-align: left; padding: 0 5px;'>"
             f"{text}"
             f"</div>"
             f"</div>"
         )
-    
+        
+        # 添加列表图片之间的浅色分割线（最后一张图下方不需要）
+        if i < len(panels) - 1:
+            html_parts.append("<hr style='border:none; border-top:1px solid #E5E7EB; margin:25px 0;'/>")
+            
     html_parts.append("</div>")
     return "".join(html_parts)
 
@@ -424,8 +514,9 @@ def finish_and_extract(history, session_id, uploaded_image):
         return extracted_script, ""
 
     # 2. 将本地图片上传给扣子，换取官方认可的 file_id
-    coze_image_param = upload_image_to_coze(uploaded_image)
+    coze_image_param, upload_error = upload_image_to_coze(uploaded_image)
     if not coze_image_param:
+        print(f"finish_and_extract 图片上传失败: {upload_error}")
         return extracted_script, ""
 
     # 3. 带着文字剧本和合法的图片参数，去呼叫生图工作流
@@ -445,9 +536,9 @@ def generate_comic_with_reference(script, reference_image, session_id):
         return "", "❌ 错误：请先上传参考图片，再生成漫画！"
     
     # 将本地图片上传给扣子，换取官方认可的 file_id
-    coze_image_param = upload_image_to_coze(reference_image)
+    coze_image_param, upload_error = upload_image_to_coze(reference_image)
     if not coze_image_param:
-        return "", "❌ 错误：参考图片上传失败，请重新上传后再试！"
+        return "", f"❌ 错误：参考图片上传失败：{upload_error}"
     
     # 调用工作流，传入参考图片
     _, workflow_error, raw_data = run_coze_workflow(script, coze_image_param)
