@@ -84,6 +84,75 @@ def call_coze_bot_v3(bot_id, user_id, message):
         return f"系统调用异常: {str(e)}"
 
 
+def call_coze_bot_v3_stream(bot_id, user_id, message):
+    """
+    通用扣子 v3 智能体对话接口（流式版本）。
+    使用 SSE (Server-Sent Events) 实现打字机效果的逐字输出。
+    流程：发起流式对话请求 -> 解析 SSE 事件流 -> 逐块 yield 文本内容
+    """
+    if not COZE_API_TOKEN or not bot_id:
+        yield "⚠️ 系统提示：环境变量中缺失 API Token 或 Bot ID，请检查 .env 文件。"
+        return
+
+    headers = {
+        "Authorization": f"Bearer {COZE_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    chat_url = "https://api.coze.cn/v3/chat"
+    payload = {
+        "bot_id": bot_id,
+        "user_id": user_id,
+        "stream": True,
+        "auto_save_conversation": True,
+        "additional_messages": [
+            {"role": "user", "content": message, "content_type": "text"}
+        ]
+    }
+
+    try:
+        response = requests.post(
+            chat_url, headers=headers, json=payload,
+            stream=True, timeout=120, proxies=NO_PROXY
+        )
+
+        if response.status_code != 200:
+            yield f"接口请求失败: HTTP {response.status_code}"
+            return
+
+        current_event = None
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+
+            if line.startswith("event:"):
+                current_event = line[6:].strip()
+            elif line.startswith("data:"):
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    return
+
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if current_event == "conversation.message.delta":
+                    content = data.get("content", "")
+                    if content:
+                        yield content
+                elif current_event == "conversation.chat.failed":
+                    yield f"\n\n对话失败: {data.get('msg', '未知错误')}"
+                    return
+                elif current_event == "conversation.chat.completed":
+                    return
+
+    except requests.Timeout:
+        yield "\n\n请求超时，请稍后重试。"
+    except Exception as e:
+        yield f"\n\n系统调用异常: {str(e)}"
+
+
 # ==========================================
 # 新增：图片转 Base64 的辅助函数
 # ==========================================
@@ -447,7 +516,7 @@ def render_comic_html(panels):
 # 3. 前端交互控制逻辑
 # ==========================================
 def user_send(user_message, input_mode, audio_input, video_input, history, session_id):
-    """处理文字、语音和视频输入，并将本次消息交给对话机器人。"""
+    """处理文字、语音和视频输入，并以流式打字机效果逐字输出机器人回复。"""
     message = ""
     if input_mode == "文字":
         message = (user_message or "").strip()
@@ -459,13 +528,17 @@ def user_send(user_message, input_mode, audio_input, video_input, history, sessi
             message = f"（用户发起了一段视频通话：{os.path.basename(video_input)}）"
 
     if not message:
-        return "", None, None, history
+        yield "", None, None, history
+        return
 
     history.append({"role": "user", "content": message})
-    bot_reply = call_coze_bot_v3(CHAT_BOT_ID, session_id, message)
-    history.append({"role": "assistant", "content": bot_reply})
+    history.append({"role": "assistant", "content": ""})
 
-    return "", None, None, history
+    yield "", None, None, history
+
+    for chunk in call_coze_bot_v3_stream(CHAT_BOT_ID, session_id, message):
+        history[-1]["content"] += chunk
+        yield "", None, None, history
 
 
 def toggle_input_mode(input_mode):
