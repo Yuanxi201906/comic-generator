@@ -103,12 +103,16 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
     # 【修改点 1】: 将前端传来的 history 组装成扣子需要的上下文格式
     # 注意：history 的最后一个元素是我们刚塞进去的空 assistant 占位符，所以用 [:-1] 剔除它
     messages_payload = []
+    # 遍历 history[:-1]（排除最后那个正在生成的空占位符）
     for msg in history[:-1]:
-        messages_payload.append({
-            "role": msg["role"],
-            "content": msg["content"],
-            "content_type": "text"
-        })
+        content = msg.get("content", "").strip()
+        # 🌟 关键修复：绝对不能把空字符串传给扣子，否则会引发模型错乱
+        if content: 
+            messages_payload.append({
+                "role": msg["role"],
+                "content": content,
+                "content_type": "text"
+            })
 
     payload = {
         "bot_id": bot_id,
@@ -129,7 +133,7 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
             return
 
         response.encoding = 'utf-8'
-        
+
         current_event = None
         for line in response.iter_lines(decode_unicode=True):
             if not line:
