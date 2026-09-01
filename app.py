@@ -6,6 +6,7 @@ import time
 import json
 import base64
 import socket
+import re
 from dotenv import load_dotenv
 
 # ==========================================
@@ -95,14 +96,11 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
     }
     chat_url = "https://api.coze.cn/v3/chat"
     
-    # 🌟 按照新版 Gradio 报错的要求，转换为 role/content 字典格式
     messages_payload = []
     for msg in history[:-1]:
-        # 兼容处理：既兼容普通字典，也兼容 Gradio 的 ChatMessage 对象
         role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
         content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
         
-        # 过滤掉没有实质内容的空消息，防止扣子报错
         if content and str(content).strip():
             messages_payload.append({
                 "role": role,
@@ -118,6 +116,7 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
         "additional_messages": messages_payload
     }
 
+    display_text = ""
     try:
         response = requests.post(
             chat_url, headers=headers, json=payload,
@@ -130,6 +129,8 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
         response.encoding = 'utf-8'
 
         current_event = None
+        full_raw_content = ""
+
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -148,19 +149,40 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
 
                 if current_event == "conversation.message.delta":
                     if data.get("type") == "answer":
-                        content = data.get("content", "")
-                        if content:
-                            yield content
+                        chunk = data.get("content", "")
+                        if chunk:
+                            full_raw_content += chunk
+                            
+                            # 🌟 核心清洗逻辑：智能拦截 Coze 返回的数组格式并提取纯文本
+                            temp_text = full_raw_content.lstrip()
+                            if temp_text.startswith("[{") or temp_text.startswith("{"):
+                                # 正则匹配提取 text 字段内容
+                                pattern = r"(?:'text'|\"text\")\s*:\s*(['\"])(.*?)(?:(?<!\\)\1|$)"
+                                matches = re.findall(pattern, temp_text, flags=re.DOTALL)
+                                if matches:
+                                    temp_text = "".join([m[1] for m in matches])
+                                    # 处理被序列化的换行符和引号
+                                    temp_text = temp_text.replace("\\n", "\n").replace("\\'", "'").replace('\\"', '"')
+                                else:
+                                    temp_text = ""
+                            elif temp_text == "[" or temp_text == '{"':
+                                temp_text = ""
+                            
+                            display_text = temp_text
+                            
+                            # 每次向前端 yield 完整的、干净的文本
+                            yield display_text
+                            
                 elif current_event == "conversation.chat.failed":
-                    yield f"\n\n对话失败: {data.get('msg', '未知错误')}"
+                    yield display_text + f"\n\n对话失败: {data.get('msg', '未知错误')}"
                     return
                 elif current_event == "conversation.chat.completed":
                     return
 
     except requests.Timeout:
-        yield "\n\n请求超时，请稍后重试。"
+        yield display_text + "\n\n请求超时，请稍后重试。"
     except Exception as e:
-        yield f"\n\n系统调用异常: {str(e)}"
+        yield display_text + f"\n\n系统调用异常: {str(e)}"
 
 # ==========================================
 # 新增：图片转 Base64 的辅助函数
@@ -540,19 +562,17 @@ def user_send(user_message, input_mode, audio_input, video_input, history, sessi
         yield "", None, None, history
         return
 
-    # 🌟 严格使用报错所要求的字典格式追加记录
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": ""})
     yield "", None, None, history
 
-    for chunk in call_coze_bot_v3_stream(CHAT_BOT_ID, session_id, history):
-        # 兼容更新最后一条数据
+    # 🌟 修改点：这里接收的是清洗后的“完整内容”，所以直接用 `=` 覆盖，不用 `+=` 拼接
+    for full_text in call_coze_bot_v3_stream(CHAT_BOT_ID, session_id, history):
         if isinstance(history[-1], dict):
-            history[-1]["content"] += chunk
+            history[-1]["content"] = full_text
         else:
-            history[-1].content += chunk
+            history[-1].content = full_text
         yield "", None, None, history
-
 def toggle_input_mode(input_mode):
     """根据输入方式显示对应的输入控件。"""
     return (
