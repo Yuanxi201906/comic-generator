@@ -95,19 +95,18 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
     }
     chat_url = "https://api.coze.cn/v3/chat"
     
-    # 🌟 兼容经典 Gradio 格式：[[user_msg, bot_msg], ...]
+    # 🌟 按照新版 Gradio 报错的要求，转换为 role/content 字典格式
     messages_payload = []
-    for user_msg, bot_msg in history[:-1]:
-        if user_msg and str(user_msg).strip():
+    for msg in history[:-1]:
+        # 兼容处理：既兼容普通字典，也兼容 Gradio 的 ChatMessage 对象
+        role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
+        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+        
+        # 过滤掉没有实质内容的空消息，防止扣子报错
+        if content and str(content).strip():
             messages_payload.append({
-                "role": "user",
-                "content": str(user_msg).strip(),
-                "content_type": "text"
-            })
-        if bot_msg and str(bot_msg).strip():
-            messages_payload.append({
-                "role": "assistant",
-                "content": str(bot_msg).strip(),
+                "role": role,
+                "content": str(content).strip(),
                 "content_type": "text"
             })
 
@@ -541,13 +540,17 @@ def user_send(user_message, input_mode, audio_input, video_input, history, sessi
         yield "", None, None, history
         return
 
-    # 🌟 经典格式：追加一个 [用户输入, 空的机器人回复] 的列表
-    history.append([message, ""])
+    # 🌟 严格使用报错所要求的字典格式追加记录
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": ""})
     yield "", None, None, history
 
     for chunk in call_coze_bot_v3_stream(CHAT_BOT_ID, session_id, history):
-        # 🌟 经典格式：更新最后一条记录的索引 [1]（即机器人回复的部分）
-        history[-1][1] += chunk
+        # 兼容更新最后一条数据
+        if isinstance(history[-1], dict):
+            history[-1]["content"] += chunk
+        else:
+            history[-1].content += chunk
         yield "", None, None, history
 
 def toggle_input_mode(input_mode):
@@ -583,12 +586,16 @@ def finish_and_extract(history, session_id, uploaded_image):
         return "聊天记录为空，没有任何可以总结的内容哦！", ""
     
     chat_log = ""
-    # 🌟 经典格式提取对话
-    for user_msg, bot_msg in history:
-        if user_msg and str(user_msg).strip():
-            chat_log += f"学生：{user_msg}\n"
-        if bot_msg and str(bot_msg).strip():
-            chat_log += f"AI：{bot_msg}\n"
+    # 🌟 使用对象/字典双重兼容提取数据
+    for msg in history:
+        role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
+        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+        
+        if content and str(content).strip():
+            if role == "user":
+                chat_log += f"学生：{content}\n"
+            elif role == "assistant":
+                chat_log += f"AI：{content}\n"
     
     extracted_script = call_coze_bot_v3(SCRIPT_BOT_ID, session_id, chat_log)
 
