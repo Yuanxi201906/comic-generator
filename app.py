@@ -84,11 +84,10 @@ def call_coze_bot_v3(bot_id, user_id, message):
         return f"系统调用异常: {str(e)}"
 
 
-def call_coze_bot_v3_stream(bot_id, user_id, message):
+def call_coze_bot_v3_stream(bot_id, user_id, history):
     """
     通用扣子 v3 智能体对话接口（流式版本）。
-    使用 SSE (Server-Sent Events) 实现打字机效果的逐字输出。
-    流程：发起流式对话请求 -> 解析 SSE 事件流 -> 逐块 yield 文本内容
+    传入完整的 history，让大模型拥有多轮对话记忆。
     """
     if not COZE_API_TOKEN or not bot_id:
         yield "⚠️ 系统提示：环境变量中缺失 API Token 或 Bot ID，请检查 .env 文件。"
@@ -100,14 +99,23 @@ def call_coze_bot_v3_stream(bot_id, user_id, message):
     }
 
     chat_url = "https://api.coze.cn/v3/chat"
+    
+    # 【修改点 1】: 将前端传来的 history 组装成扣子需要的上下文格式
+    # 注意：history 的最后一个元素是我们刚塞进去的空 assistant 占位符，所以用 [:-1] 剔除它
+    messages_payload = []
+    for msg in history[:-1]:
+        messages_payload.append({
+            "role": msg["role"],
+            "content": msg["content"],
+            "content_type": "text"
+        })
+
     payload = {
         "bot_id": bot_id,
-        "user_id": user_id,
+        "user_id": str(user_id),
         "stream": True,
-        "auto_save_conversation": True,
-        "additional_messages": [
-            {"role": "user", "content": message, "content_type": "text"}
-        ]
+        "auto_save_conversation": False, # 由我们自己每次传递全量上下文，不需要云端瞎保存
+        "additional_messages": messages_payload
     }
 
     try:
@@ -138,9 +146,11 @@ def call_coze_bot_v3_stream(bot_id, user_id, message):
                     continue
 
                 if current_event == "conversation.message.delta":
-                    content = data.get("content", "")
-                    if content:
-                        yield content
+                    # 【修改点 2】: 核心过滤机制！必须确保 type 是 answer（最终文本回复），过滤掉插件调用和内部思考日志
+                    if data.get("type") == "answer":
+                        content = data.get("content", "")
+                        if content:
+                            yield content
                 elif current_event == "conversation.chat.failed":
                     yield f"\n\n对话失败: {data.get('msg', '未知错误')}"
                     return
@@ -531,13 +541,17 @@ def user_send(user_message, input_mode, audio_input, video_input, history, sessi
         yield "", None, None, history
         return
 
+    # 先把用户的话，以及机器人的空位放入 history
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": ""})
 
+    # 先把界面刷新一下，让用户看到自己的话
     yield "", None, None, history
 
-    for chunk in call_coze_bot_v3_stream(CHAT_BOT_ID, session_id, message):
+    # 【修改点 3】: 这里将原来的 message 参数改为了 history，把历史记录都传过去
+    for chunk in call_coze_bot_v3_stream(CHAT_BOT_ID, session_id, history):
         history[-1]["content"] += chunk
+        # 每收到一个字，就更新一次界面
         yield "", None, None, history
 
 
