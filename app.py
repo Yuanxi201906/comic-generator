@@ -85,10 +85,6 @@ def call_coze_bot_v3(bot_id, user_id, message):
 
 
 def call_coze_bot_v3_stream(bot_id, user_id, history):
-    """
-    通用扣子 v3 智能体对话接口（流式版本）。
-    传入完整的 history，让大模型拥有多轮对话记忆。
-    """
     if not COZE_API_TOKEN or not bot_id:
         yield "⚠️ 系统提示：环境变量中缺失 API Token 或 Bot ID，请检查 .env 文件。"
         return
@@ -97,20 +93,21 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
         "Authorization": f"Bearer {COZE_API_TOKEN}",
         "Content-Type": "application/json"
     }
-
     chat_url = "https://api.coze.cn/v3/chat"
     
-    # 【修改点 1】: 将前端传来的 history 组装成扣子需要的上下文格式
-    # 注意：history 的最后一个元素是我们刚塞进去的空 assistant 占位符，所以用 [:-1] 剔除它
+    # 🌟 兼容经典 Gradio 格式：[[user_msg, bot_msg], ...]
     messages_payload = []
-    # 遍历 history[:-1]（排除最后那个正在生成的空占位符）
-    for msg in history[:-1]:
-        content = msg.get("content", "").strip()
-        # 🌟 关键修复：绝对不能把空字符串传给扣子，否则会引发模型错乱
-        if content: 
+    for user_msg, bot_msg in history[:-1]:
+        if user_msg and str(user_msg).strip():
             messages_payload.append({
-                "role": msg["role"],
-                "content": content,
+                "role": "user",
+                "content": str(user_msg).strip(),
+                "content_type": "text"
+            })
+        if bot_msg and str(bot_msg).strip():
+            messages_payload.append({
+                "role": "assistant",
+                "content": str(bot_msg).strip(),
                 "content_type": "text"
             })
 
@@ -118,7 +115,7 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
         "bot_id": bot_id,
         "user_id": str(user_id),
         "stream": True,
-        "auto_save_conversation": False, # 由我们自己每次传递全量上下文，不需要云端瞎保存
+        "auto_save_conversation": False,
         "additional_messages": messages_payload
     }
 
@@ -127,7 +124,6 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
             chat_url, headers=headers, json=payload,
             stream=True, timeout=120, proxies=NO_PROXY
         )
-
         if response.status_code != 200:
             yield f"接口请求失败: HTTP {response.status_code}"
             return
@@ -152,7 +148,6 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
                     continue
 
                 if current_event == "conversation.message.delta":
-                    # 【修改点 2】: 核心过滤机制！必须确保 type 是 answer（最终文本回复），过滤掉插件调用和内部思考日志
                     if data.get("type") == "answer":
                         content = data.get("content", "")
                         if content:
@@ -167,7 +162,6 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
         yield "\n\n请求超时，请稍后重试。"
     except Exception as e:
         yield f"\n\n系统调用异常: {str(e)}"
-
 
 # ==========================================
 # 新增：图片转 Base64 的辅助函数
@@ -547,19 +541,14 @@ def user_send(user_message, input_mode, audio_input, video_input, history, sessi
         yield "", None, None, history
         return
 
-    # 先把用户的话，以及机器人的空位放入 history
-    history.append({"role": "user", "content": message})
-    history.append({"role": "assistant", "content": ""})
-
-    # 先把界面刷新一下，让用户看到自己的话
+    # 🌟 经典格式：追加一个 [用户输入, 空的机器人回复] 的列表
+    history.append([message, ""])
     yield "", None, None, history
 
-    # 【修改点 3】: 这里将原来的 message 参数改为了 history，把历史记录都传过去
     for chunk in call_coze_bot_v3_stream(CHAT_BOT_ID, session_id, history):
-        history[-1]["content"] += chunk
-        # 每收到一个字，就更新一次界面
+        # 🌟 经典格式：更新最后一条记录的索引 [1]（即机器人回复的部分）
+        history[-1][1] += chunk
         yield "", None, None, history
-
 
 def toggle_input_mode(input_mode):
     """根据输入方式显示对应的输入控件。"""
@@ -594,29 +583,26 @@ def finish_and_extract(history, session_id, uploaded_image):
         return "聊天记录为空，没有任何可以总结的内容哦！", ""
     
     chat_log = ""
-    for msg in history:
-        if msg.get("role") == "user":
-            chat_log += f"学生：{msg.get('content')}\n"
-        elif msg.get("role") == "assistant":
-            chat_log += f"AI：{msg.get('content')}\n"
+    # 🌟 经典格式提取对话
+    for user_msg, bot_msg in history:
+        if user_msg and str(user_msg).strip():
+            chat_log += f"学生：{user_msg}\n"
+        if bot_msg and str(bot_msg).strip():
+            chat_log += f"AI：{bot_msg}\n"
     
-    # 1. 呼叫编剧大脑提炼文字
     extracted_script = call_coze_bot_v3(SCRIPT_BOT_ID, session_id, chat_log)
 
     if extracted_script.startswith(("接口请求失败:", "系统调用异常:", "⚠️")):
         return extracted_script, ""
     
-    # 没有参考图时只生成剧本，避免向要求图片的工作流发送缺少参数的请求。
     if not uploaded_image:
         return extracted_script, ""
 
-    # 2. 将本地图片上传给扣子，换取官方认可的 file_id
     coze_image_param, upload_error = upload_image_to_coze(uploaded_image)
     if not coze_image_param:
         print(f"finish_and_extract 图片上传失败: {upload_error}")
         return extracted_script, ""
 
-    # 3. 带着文字剧本和合法的图片参数，去呼叫生图工作流
     _, _, raw_data = run_coze_workflow(extracted_script, coze_image_param)
     
     if raw_data:
@@ -774,6 +760,7 @@ with gr.Blocks() as demo:
         # ---------------- 左侧功能区 ----------------
         with gr.Column(scale=5):
             gr.Markdown("### 💬 第一步：情景演练")
+            # ✅ 必须确保是这样（在括号最后加上 type 参数）：
             chatbot = gr.Chatbot(label="聊天室", height=380, avatar_images=(None, None))
             
             with gr.Row():
