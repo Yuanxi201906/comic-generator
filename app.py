@@ -128,6 +128,8 @@ def call_coze_bot_v3_stream(bot_id, user_id, history):
             yield f"接口请求失败: HTTP {response.status_code}"
             return
 
+        response.encoding = 'utf-8'
+        
         current_event = None
         for line in response.iter_lines(decode_unicode=True):
             if not line:
